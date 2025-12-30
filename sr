@@ -1,0 +1,833 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+"""
+sr - Sveriges Radio for MeeGo Harmattan
+"""
+
+import sys
+import json
+import subprocess
+import threading
+from datetime import datetime
+
+from PySide.QtCore import QObject, Slot, Signal, QTimer, QUrl, Property
+from PySide.QtGui import QApplication
+from PySide.QtDeclarative import QDeclarativeView
+
+# Sveriges Radio API
+API_BASE = "https://api.sr.se/api/v2"
+
+# HTTP Stream URLs (kein SSL in QtMultimediaKit)
+# P2 wurde zu P2 Musik umbenannt
+STREAM_MAP = {
+    132: 'http://http-live.sr.se/p1-mp3-192',
+    163: 'http://http-live.sr.se/p2musik-mp3-192',  # P2 -> P2 Musik
+    164: 'http://http-live.sr.se/p3-mp3-192',
+    701: 'http://http-live.sr.se/p4stockholm-mp3-192',
+    2576: 'http://http-live.sr.se/dingata-mp3-192',
+    2562: 'http://http-live.sr.se/p3star-mp3-192',
+}
+
+# Hauptkanäle
+CHANNELS = [
+    {'id': 132, 'name': 'P1'},
+    {'id': 163, 'name': 'P2 Musik'},
+    {'id': 164, 'name': 'P3'},
+    {'id': 701, 'name': 'P4 Stockholm'},
+    {'id': 2576, 'name': 'Din Gata'},
+    {'id': 2562, 'name': 'P3 Star'},
+]
+
+
+class srHelper(QObject):
+    """Backend for sr"""
+    
+    # Signals
+    channelsChanged = Signal()
+    currentShowChanged = Signal()
+    latestEpisodesChanged = Signal()
+    categoriesChanged = Signal()
+    programsChanged = Signal()
+    episodesChanged = Signal()
+    searchResultsChanged = Signal()
+    playUrlChanged = Signal()
+    downloadProgressChanged = Signal()
+    downloadFinished = Signal()
+    
+    def __init__(self, parent=None):
+        super(srHelper, self).__init__(parent)
+        self._pending = {}
+        
+        # Data properties
+        self._channelsJson = '[]'
+        self._currentShowJson = '{}'
+        self._latestJson = '[]'
+        self._categoriesJson = '[]'
+        self._programsJson = '[]'
+        self._episodesJson = '[]'
+        self._searchJson = '[]'
+        self._playUrl = ''
+        self._playName = ''
+        self._playImage = ''
+        
+        # Download properties
+        self._downloadActive = False
+        self._downloadProgress = 0
+        self._downloadFile = ''
+        self._downloadProc = None
+        self._downloadSize = 0
+        
+        # Download timer
+        self.downloadTimer = QTimer()
+        self.downloadTimer.timeout.connect(self._checkDownloadProgress)
+    
+    # Properties
+    def _getChannelsJson(self):
+        return self._channelsJson
+    channelsJson = Property(str, _getChannelsJson, notify=channelsChanged)
+    
+    def _getCurrentShowJson(self):
+        return self._currentShowJson
+    currentShowJson = Property(str, _getCurrentShowJson, notify=currentShowChanged)
+    
+    def _getLatestJson(self):
+        return self._latestJson
+    latestJson = Property(str, _getLatestJson, notify=latestEpisodesChanged)
+    
+    def _getCategoriesJson(self):
+        return self._categoriesJson
+    categoriesJson = Property(str, _getCategoriesJson, notify=categoriesChanged)
+    
+    def _getProgramsJson(self):
+        return self._programsJson
+    programsJson = Property(str, _getProgramsJson, notify=programsChanged)
+    
+    def _getEpisodesJson(self):
+        return self._episodesJson
+    episodesJson = Property(str, _getEpisodesJson, notify=episodesChanged)
+    
+    def _getSearchJson(self):
+        return self._searchJson
+    searchJson = Property(str, _getSearchJson, notify=searchResultsChanged)
+    
+    def _getPlayUrl(self):
+        return self._playUrl
+    playUrl = Property(str, _getPlayUrl, notify=playUrlChanged)
+    
+    def _getPlayName(self):
+        return self._playName
+    playName = Property(str, _getPlayName, notify=playUrlChanged)
+    
+    def _getPlayImage(self):
+        return self._playImage
+    playImage = Property(str, _getPlayImage, notify=playUrlChanged)
+    
+    def _getDownloadActive(self):
+        return self._downloadActive
+    downloadActive = Property(bool, _getDownloadActive, notify=downloadProgressChanged)
+    
+    def _getDownloadProgress(self):
+        return self._downloadProgress
+    downloadProgress = Property(int, _getDownloadProgress, notify=downloadProgressChanged)
+    
+    def _getDownloadFilePath(self):
+        return self._downloadFile
+    downloadFilePath = Property(str, _getDownloadFilePath, notify=downloadProgressChanged)
+    
+    def _fetchUrl(self, url):
+        """Fetch URL using wget from wunderw (SSL support)"""
+        try:
+            # Verwende wunderw wget mit modernem SSL
+            wget_path = '/opt/wunderw/bin/wget'
+            proc = subprocess.Popen(
+                [wget_path, '-q', '-O', '-', '--timeout=15', url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = proc.communicate()
+            return stdout
+        except Exception as e:
+            print u"Fetch error: %s" % e
+            return None
+    
+    # ==================== CHANNELS ====================
+    
+    @Slot()
+    def loadChannels(self):
+        """Load main channels"""
+        print u"Loading channels..."
+        self._channelsJson = json.dumps(CHANNELS)
+        self.channelsChanged.emit()
+    
+    @Slot()
+    def loadAllChannels(self):
+        """Load all channels from API"""
+        print u"Loading all channels..."
+        
+        def worker():
+            try:
+                url = "%s/channels?format=json&pagination=false" % API_BASE
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['allChannels'] = data
+            except Exception as e:
+                print u"Channels error: %s" % e
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'allChannels' in self._pending:
+                data = self._pending.pop('allChannels')
+                self._handleAllChannels(data)
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleAllChannels(self, data):
+        """Parse all channels"""
+        try:
+            response = json.loads(data)
+            channels = response.get('channels', [])
+            
+            items = []
+            for c in channels:
+                item = {
+                    'id': c.get('id', 0),
+                    'name': c.get('name', ''),
+                    'image': c.get('image', '')
+                }
+                items.append(item)
+            
+            print u"Found %d channels" % len(items)
+            self._channelsJson = json.dumps(items)
+            self.channelsChanged.emit()
+            
+        except Exception as e:
+            print u"Parse channels error: %s" % e
+    
+    # ==================== CURRENT SHOW ====================
+    
+    @Slot(int)
+    def loadCurrentShow(self, channelId):
+        """Load current show for channel"""
+        print u"Loading current show for channel: %d" % channelId
+        
+        def worker():
+            try:
+                url = "%s/scheduledepisodes/rightnow?channelid=%d&format=json" % (API_BASE, channelId)
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['currentShow_%d' % channelId] = data
+            except Exception as e:
+                print u"Current show error: %s" % e
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        key = 'currentShow_%d' % channelId
+        def check():
+            if key in self._pending:
+                data = self._pending.pop(key)
+                self._handleCurrentShow(data, channelId)
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleCurrentShow(self, data, channelId):
+        """Parse current show"""
+        try:
+            response = json.loads(data)
+            channel = response.get('channel', {})
+            current = channel.get('currentscheduledepisode', {})
+            next_ep = channel.get('nextscheduledepisode', {})
+            
+            show = {
+                'channelId': channelId,
+                'channelName': channel.get('name', ''),
+                'title': current.get('title', channel.get('name', '')),
+                'description': current.get('description', ''),
+                'nextTitle': next_ep.get('title', ''),
+                'nextStart': next_ep.get('starttimeutc', '')
+            }
+            
+            self._currentShowJson = json.dumps(show)
+            self.currentShowChanged.emit()
+            
+        except Exception as e:
+            print u"Parse current show error: %s" % e
+    
+    # ==================== LATEST EPISODES ====================
+    
+    @Slot()
+    def loadLatestEpisodes(self):
+        """Load latest published episodes"""
+        print u"Loading latest episodes..."
+        
+        def worker():
+            try:
+                url = "%s/lastpublished?format=json&pagination=false" % API_BASE
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['latest'] = data
+            except Exception as e:
+                print u"Latest error: %s" % e
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'latest' in self._pending:
+                data = self._pending.pop('latest')
+                self._handleLatest(data)
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleLatest(self, data):
+        """Parse latest episodes"""
+        try:
+            response = json.loads(data)
+            shows = response.get('shows', [])
+            
+            items = []
+            for s in shows[:20]:
+                # Get playback URL
+                url = ''
+                if s.get('listenpodfile'):
+                    url = s['listenpodfile'].get('url', '')
+                elif s.get('broadcast') and s['broadcast'].get('broadcastfiles'):
+                    files = s['broadcast']['broadcastfiles']
+                    if files:
+                        url = files[0].get('url', '')
+                
+                if url:
+                    item = {
+                        'id': s.get('id', 0),
+                        'title': s.get('title', ''),
+                        'programName': s.get('program', {}).get('name', ''),
+                        'programId': s.get('program', {}).get('id', 0),
+                        'imageUrl': s.get('imageurl', ''),
+                        'url': url,
+                        'description': s.get('description', '')
+                    }
+                    items.append(item)
+            
+            print u"Found %d latest episodes" % len(items)
+            self._latestJson = json.dumps(items)
+            self.latestEpisodesChanged.emit()
+            
+        except Exception as e:
+            print u"Parse latest error: %s" % e
+    
+    # ==================== CATEGORIES ====================
+    
+    @Slot()
+    def loadCategories(self):
+        """Load program categories"""
+        print u"Loading categories..."
+        
+        def worker():
+            try:
+                url = "%s/programcategories?format=json&pagination=false" % API_BASE
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['categories'] = data
+            except Exception as e:
+                print u"Categories error: %s" % e
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'categories' in self._pending:
+                data = self._pending.pop('categories')
+                self._handleCategories(data)
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleCategories(self, data):
+        """Parse categories"""
+        try:
+            response = json.loads(data)
+            categories = response.get('programcategories', [])
+            
+            items = []
+            for c in categories:
+                item = {
+                    'id': c.get('id', 0),
+                    'name': c.get('name', '')
+                }
+                items.append(item)
+            
+            print u"Found %d categories" % len(items)
+            self._categoriesJson = json.dumps(items)
+            self.categoriesChanged.emit()
+            
+        except Exception as e:
+            print u"Parse categories error: %s" % e
+    
+    @Slot(int)
+    def loadCategoryPrograms(self, categoryId):
+        """Load programs in category"""
+        print u"Loading programs for category: %d" % categoryId
+        
+        def worker():
+            try:
+                url = "%s/programs/index?programcategoryid=%d&format=json&pagination=false" % (API_BASE, categoryId)
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['programs'] = data
+            except Exception as e:
+                print u"Programs error: %s" % e
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'programs' in self._pending:
+                data = self._pending.pop('programs')
+                self._handlePrograms(data)
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handlePrograms(self, data):
+        """Parse programs"""
+        try:
+            response = json.loads(data)
+            programs = response.get('programs', [])
+            
+            items = []
+            for p in programs:
+                item = {
+                    'id': p.get('id', 0),
+                    'name': p.get('name', ''),
+                    'description': p.get('description', '')[:100] if p.get('description') else '',
+                    'imageUrl': p.get('programimage', '')
+                }
+                items.append(item)
+            
+            print u"Found %d programs" % len(items)
+            self._programsJson = json.dumps(items)
+            self.programsChanged.emit()
+            
+        except Exception as e:
+            print u"Parse programs error: %s" % e
+    
+    # ==================== EPISODES ====================
+    
+    @Slot(int)
+    def loadProgramEpisodes(self, programId):
+        """Load episodes for program"""
+        print u"Loading episodes for program: %d" % programId
+        
+        def worker():
+            try:
+                url = "%s/episodes/index?programid=%d&format=json&size=20" % (API_BASE, programId)
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['episodes'] = data
+            except Exception as e:
+                print u"Episodes error: %s" % e
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'episodes' in self._pending:
+                data = self._pending.pop('episodes')
+                self._handleEpisodes(data)
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleEpisodes(self, data):
+        """Parse episodes"""
+        try:
+            response = json.loads(data)
+            episodes = response.get('episodes', [])
+            
+            items = []
+            for e in episodes:
+                url = ''
+                if e.get('listenpodfile'):
+                    url = e['listenpodfile'].get('url', '')
+                elif e.get('broadcast') and e['broadcast'].get('broadcastfiles'):
+                    files = e['broadcast']['broadcastfiles']
+                    if files:
+                        url = files[0].get('url', '')
+                
+                if url:
+                    item = {
+                        'id': e.get('id', 0),
+                        'title': e.get('title', ''),
+                        'description': e.get('description', ''),
+                        'imageUrl': e.get('imageurl', ''),
+                        'url': url,
+                        'publishDate': e.get('publishdateutc', '')
+                    }
+                    items.append(item)
+            
+            print u"Found %d episodes" % len(items)
+            self._episodesJson = json.dumps(items)
+            self.episodesChanged.emit()
+            
+        except Exception as e:
+            print u"Parse episodes error: %s" % e
+    
+    # ==================== SEARCH ====================
+    
+    @Slot(str)
+    def search(self, query):
+        """Search episodes"""
+        if len(query) < 2:
+            return
+        
+        print u"Searching: %s" % query
+        
+        def worker():
+            try:
+                url = "%s/episodes/search?query=%s&format=json" % (API_BASE, query)
+                data = self._fetchUrl(url)
+                if data:
+                    self._pending['search'] = data
+            except Exception as e:
+                print u"Search error: %s" % e
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if 'search' in self._pending:
+                data = self._pending.pop('search')
+                self._handleSearch(data)
+            elif t.is_alive():
+                QTimer.singleShot(200, check)
+        
+        QTimer.singleShot(200, check)
+    
+    def _handleSearch(self, data):
+        """Parse search results"""
+        try:
+            response = json.loads(data)
+            episodes = response.get('episodes', [])
+            
+            items = []
+            for e in episodes[:25]:
+                url = ''
+                if e.get('listenpodfile'):
+                    url = e['listenpodfile'].get('url', '')
+                elif e.get('broadcast') and e['broadcast'].get('broadcastfiles'):
+                    files = e['broadcast']['broadcastfiles']
+                    if files:
+                        url = files[0].get('url', '')
+                
+                item = {
+                    'id': e.get('id', 0),
+                    'title': e.get('title', ''),
+                    'programName': e.get('program', {}).get('name', ''),
+                    'programId': e.get('program', {}).get('id', 0),
+                    'imageUrl': e.get('imageurl', ''),
+                    'url': url,
+                    'description': e.get('description', '')
+                }
+                items.append(item)
+            
+            print u"Found %d search results" % len(items)
+            self._searchJson = json.dumps(items)
+            self.searchResultsChanged.emit()
+            
+        except Exception as e:
+            print u"Parse search error: %s" % e
+    
+    # ==================== PLAYBACK ====================
+    
+    @Slot(int)
+    def playChannel(self, channelId):
+        """Play live channel using HTTP stream"""
+        print u"Playing channel: %d" % channelId
+        
+        # Find channel info
+        for c in CHANNELS:
+            if c['id'] == channelId:
+                self._playName = c['name']
+                self._playImage = c.get('image', '')
+                break
+        
+        # Use HTTP stream URL from map, fallback to generic
+        if channelId in STREAM_MAP:
+            self._playUrl = STREAM_MAP[channelId]
+        else:
+            # Fallback: versuche generisches Format (HTTP)
+            self._playUrl = "http://http-live.sr.se/p%d-mp3-192" % channelId
+        
+        print u"Stream URL: %s" % self._playUrl
+        self.playUrlChanged.emit()
+    
+    @Slot(str, str, str)
+    def playEpisode(self, url, name, imageUrl):
+        """Play episode - convert HTTPS to HTTP"""
+        print u"Playing episode: %s" % name
+        # Convert HTTPS to HTTP for SSL-less playback
+        if url.startswith('https://'):
+            url = url.replace('https://', 'http://')
+        self._playUrl = url
+        self._playName = name
+        self._playImage = imageUrl
+        print u"Episode URL: %s" % self._playUrl
+        self.playUrlChanged.emit()
+    
+    @Slot(str, result=str)
+    def getChannelStreamUrl(self, channelId):
+        """Get HTTP stream URL for channel"""
+        cid = int(channelId) if channelId.isdigit() else 0
+        if cid in STREAM_MAP:
+            return STREAM_MAP[cid]
+        return "http://http-live.sr.se/p%s-mp3-192" % channelId
+    
+    # ==================== DOWNLOAD ====================
+    
+    def _sanitizeFilename(self, name):
+        """Create safe filename"""
+        if isinstance(name, str):
+            name = name.decode('utf-8', 'ignore')
+        safe = name.replace(u'/', u'-').replace(u':', u'-').replace(u'?', u'')
+        safe = safe.replace(u'"', u'').replace(u'*', u'').replace(u'<', u'').replace(u'>', u'')
+        safe = safe.replace(u'|', u'-').replace(u'\\', u'-')
+        # Kürzen wenn zu lang
+        if len(safe) > 100:
+            safe = safe[:100]
+        return safe
+    
+    @Slot(str, str)
+    def downloadEpisode(self, url, title):
+        """Download episode to MyDocs"""
+        import os
+        import re
+        
+        print u"Downloading: %s" % title
+        
+        # Download-Verzeichnis
+        download_dir = u"/home/user/MyDocs/sr"
+        if not os.path.exists(download_dir):
+            try:
+                os.makedirs(download_dir)
+            except:
+                download_dir = u"/home/user/MyDocs"
+        
+        # Extrahiere Episode-ID aus URL (z.B. 10022861 aus .../10022861.mp3)
+        episode_id = ""
+        match = re.search(r'/(\d+)\.mp3', url)
+        if match:
+            episode_id = match.group(1)
+        
+        # Sichere Dateiname mit ID
+        safe_name = self._sanitizeFilename(title)
+        if episode_id:
+            self._downloadFile = os.path.join(download_dir, u"%s_%s.mp3" % (safe_name, episode_id))
+        else:
+            self._downloadFile = os.path.join(download_dir, safe_name + u".mp3")
+        
+        print u"Saving to: %s" % self._downloadFile
+        
+        # URL anpassen
+        if url.startswith('https://'):
+            url = url.replace('https://', 'http://')
+        
+        # Hole Dateigröße
+        self._downloadSize = 0
+        try:
+            proc = subprocess.Popen(
+                ['/opt/wunderw/bin/wget', '--spider', '-S', '--timeout=10', url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            _, stderr = proc.communicate()
+            for line in stderr.split('\n'):
+                if 'Content-Length:' in line:
+                    parts = line.split('Content-Length:')
+                    if len(parts) > 1:
+                        self._downloadSize = int(parts[1].strip().split()[0])
+                        break
+        except:
+            pass
+        
+        # Starte Download
+        self._downloadActive = True
+        self._downloadProgress = 0
+        self.downloadProgressChanged.emit()
+        
+        self._downloadProc = subprocess.Popen(
+            ['/opt/wunderw/bin/wget', '-q', '-O', self._downloadFile, url],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        
+        self.downloadTimer.start(500)
+    
+    def _checkDownloadProgress(self):
+        """Check download progress"""
+        import os
+        
+        if self._downloadProc and self._downloadProc.poll() is not None:
+            # Download fertig
+            self._downloadActive = False
+            self.downloadTimer.stop()
+            
+            if os.path.exists(self._downloadFile):
+                size = os.path.getsize(self._downloadFile)
+                if size > 0:
+                    self._downloadProgress = 100
+                    print u"Download complete: %s (%d bytes)" % (self._downloadFile, size)
+                    self.downloadFinished.emit()
+                else:
+                    print u"Download failed: empty file"
+            
+            self._downloadProc = None
+            self.downloadProgressChanged.emit()
+            return
+        
+        # Progress berechnen
+        import os
+        if self._downloadSize > 0 and os.path.exists(self._downloadFile):
+            current = os.path.getsize(self._downloadFile)
+            self._downloadProgress = int(100 * current / self._downloadSize)
+            self.downloadProgressChanged.emit()
+    
+    @Slot()
+    def cancelDownload(self):
+        """Cancel current download"""
+        if self._downloadProc:
+            try:
+                self._downloadProc.terminate()
+            except:
+                pass
+            self._downloadProc = None
+        self._downloadActive = False
+        self.downloadTimer.stop()
+        self.downloadProgressChanged.emit()
+    
+    @Slot(str, str, str)
+    def playEpisodeOrLocal(self, url, name, imageUrl):
+        """Play local file if exists, otherwise stream"""
+        import os
+        import re
+        
+        download_dir = u"/home/user/MyDocs/sr"
+        safe_name = self._sanitizeFilename(name)
+        
+        # Extrahiere Episode-ID aus URL
+        episode_id = ""
+        match = re.search(r'/(\d+)\.mp3', url)
+        if match:
+            episode_id = match.group(1)
+        
+        # Suche lokale Datei (mit ID wenn vorhanden)
+        if episode_id:
+            local_file = os.path.join(download_dir, u"%s_%s.mp3" % (safe_name, episode_id))
+        else:
+            local_file = os.path.join(download_dir, safe_name + u".mp3")
+        
+        if os.path.exists(local_file):
+            print u"Playing local file: %s" % local_file
+            self._playUrl = "file://" + local_file
+            self._playName = name
+            self._playImage = imageUrl
+            self.playUrlChanged.emit()
+            return
+        
+        # Fallback: Alte Datei ohne ID
+        old_file = os.path.join(download_dir, safe_name + u".mp3")
+        if os.path.exists(old_file):
+            print u"Playing local file (old format): %s" % old_file
+            self._playUrl = "file://" + old_file
+            self._playName = name
+            self._playImage = imageUrl
+            self.playUrlChanged.emit()
+            return
+        
+        # Keine lokale Datei, stream
+        self.playEpisode(url, name, imageUrl)
+    
+    @Slot(str, str, result=bool)
+    def isDownloaded(self, url, title):
+        """Check if episode is downloaded locally"""
+        import os
+        import re
+        
+        # Frühe Rückgabe bei leeren Werten
+        if not url or not title:
+            return False
+        
+        download_dir = u"/home/user/MyDocs/sr"
+        if not os.path.exists(download_dir):
+            return False
+        
+        safe_name = self._sanitizeFilename(title)
+        
+        # Extrahiere Episode-ID aus URL
+        episode_id = ""
+        match = re.search(r'/(\d+)\.mp3', url)
+        if match:
+            episode_id = match.group(1)
+        
+        # Prüfe Datei mit ID
+        if episode_id:
+            local_file = os.path.join(download_dir, u"%s_%s.mp3" % (safe_name, episode_id))
+            if os.path.exists(local_file):
+                print u"Found downloaded: %s" % local_file
+                return True
+        
+        # Prüfe alte Datei ohne ID
+        old_file = os.path.join(download_dir, safe_name + u".mp3")
+        if os.path.exists(old_file):
+            print u"Found downloaded (old): %s" % old_file
+            return True
+        
+        return False
+
+
+def main():
+    print u"=== sr 1.3.4 Starting ==="
+    
+    app = QApplication(sys.argv)
+    app.setApplicationName("sr")
+    
+    view = QDeclarativeView()
+    view.setWindowTitle("sr")
+    
+    helper = srHelper()
+    view.rootContext().setContextProperty("sr", helper)
+    
+    qml_path = "/opt/sr/qml/main.qml"
+    print u"Loading QML from: %s" % qml_path
+    view.setSource(QUrl.fromLocalFile(qml_path))
+    
+    if view.status() == QDeclarativeView.Error:
+        print u"QML Error!"
+        for error in view.errors():
+            print u"  %s" % error.toString()
+        return 1
+    
+    view.showFullScreen()
+    
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
